@@ -12,15 +12,16 @@ from flask_limiter.util import get_remote_address
 
 logger = logging.getLogger(__name__)
 
-# ── Flask-Limiter ─────────────────────────────────────────────────────────────
-# storage_uri is read lazily via lambda so it always picks up REDIS_URL *after*
-# load_dotenv() has run in app/__init__.py — even if extensions.py is imported first.
-# swallow_errors=True means a Redis outage degrades gracefully (no rate limiting)
-# rather than crashing every request.
+def _get_redis_url():
+    url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+    if url and not url.startswith("redis://") and not url.startswith("rediss://"):
+        return f"redis://{url}"
+    return url
+
 limiter = Limiter(
     key_func=get_remote_address,
     default_limits=["200 per minute"],
-    storage_uri=os.environ.get("REDIS_URL", "redis://localhost:6379/0"),
+    storage_uri=_get_redis_url(),
     swallow_errors=True,
 )
 
@@ -37,11 +38,18 @@ def get_db():
         return _db
 
     if not firebase_admin._apps:
-        sa_path = os.environ.get("FIREBASE_SERVICE_ACCOUNT_PATH", "./firebase-service-account.json")
         try:
-            cred = credentials.Certificate(sa_path)
-            _firebase_app = firebase_admin.initialize_app(cred)
-            logger.info("Firebase Admin SDK initialised from service account: %s", sa_path)
+            if "FIREBASE_SERVICE_ACCOUNT_JSON" in os.environ:
+                import json
+                cred_dict = json.loads(os.environ["FIREBASE_SERVICE_ACCOUNT_JSON"])
+                cred = credentials.Certificate(cred_dict)
+                _firebase_app = firebase_admin.initialize_app(cred)
+                logger.info("Firebase Admin SDK initialised from FIREBASE_SERVICE_ACCOUNT_JSON")
+            else:
+                sa_path = os.environ.get("FIREBASE_SERVICE_ACCOUNT_PATH", "./firebase-service-account.json")
+                cred = credentials.Certificate(sa_path)
+                _firebase_app = firebase_admin.initialize_app(cred)
+                logger.info("Firebase Admin SDK initialised from service account: %s", sa_path)
         except Exception as exc:
             logger.exception("Failed to initialise Firebase Admin SDK: %s", exc)
             raise

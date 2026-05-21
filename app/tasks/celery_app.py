@@ -9,7 +9,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+_raw_redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+if _raw_redis_url and not _raw_redis_url.startswith("redis://") and not _raw_redis_url.startswith("rediss://"):
+    REDIS_URL = f"redis://{_raw_redis_url}"
+else:
+    REDIS_URL = _raw_redis_url
 
 celery_app = Celery(
     "mytenant",
