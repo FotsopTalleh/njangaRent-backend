@@ -1,0 +1,96 @@
+version: "3.9"
+
+services:
+
+  # ── Flask API ───────────────────────────────────────────────────────────────
+  flask:
+    build: .
+    container_name: mytenant-flask
+    ports:
+      - "5000:5000"
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+      n8n:
+        condition: service_started
+    volumes:
+      # Dev hot-reload: mount source; remove in production
+      - ./app:/app/app
+      - ./firebase-service-account.json:/app/firebase-service-account.json:ro
+    command: flask run --host=0.0.0.0 --port=5000 --reload --debug
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── Celery Worker ───────────────────────────────────────────────────────────
+  celery-worker:
+    build: .
+    container_name: mytenant-celery-worker
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+      flask:
+        condition: service_started
+    volumes:
+      - ./firebase-service-account.json:/app/firebase-service-account.json:ro
+    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=2
+    restart: unless-stopped
+
+  # ── Celery Beat (scheduler) ─────────────────────────────────────────────────
+  celery-beat:
+    build: .
+    container_name: mytenant-celery-beat
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+      flask:
+        condition: service_started
+    volumes:
+      - ./firebase-service-account.json:/app/firebase-service-account.json:ro
+    command: celery -A tasks.celery_app beat --loglevel=info --scheduler celery.beat.PersistentScheduler
+    restart: unless-stopped
+
+  # ── Redis ───────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: mytenant-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes  # AOF persistence
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── n8n (self-hosted OCR automation) ────────────────────────────────────────
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: mytenant-n8n
+    ports:
+      - "5678:5678"
+    env_file: .env
+    environment:
+      - N8N_HOST=n8n
+      - N8N_PROTOCOL=http
+      - WEBHOOK_URL=http://n8n:5678/
+      - GENERIC_TIMEZONE=UTC
+      - N8N_LOG_LEVEL=info
+    volumes:
+      - n8n_data:/home/node/.n8n
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+    driver: local
+  n8n_data:
+    driver: local
