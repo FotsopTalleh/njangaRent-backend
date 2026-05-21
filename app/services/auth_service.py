@@ -29,7 +29,11 @@ class AuthService:
         self._access_expiry_min: int  = int(os.environ.get("ACCESS_TOKEN_EXPIRY_MINUTES", 15))
         self._refresh_expiry_days: int = int(os.environ.get("REFRESH_TOKEN_EXPIRY_DAYS", 7))
 
-        redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+        _raw_redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+        if _raw_redis_url and not _raw_redis_url.startswith("redis://") and not _raw_redis_url.startswith("rediss://"):
+            redis_url = f"redis://{_raw_redis_url}"
+        else:
+            redis_url = _raw_redis_url
         self._redis: redis.Redis = redis.Redis.from_url(redis_url, decode_responses=True)
 
     # ── Access token ─────────────────────────────────────────────────────────
