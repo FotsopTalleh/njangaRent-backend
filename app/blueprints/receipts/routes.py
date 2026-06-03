@@ -292,3 +292,85 @@ def create_manual_receipt():
 
     return success_response(data=receipt, status_code=201)
 
+
+@receipts_bp.route("/<receipt_id>/draft", methods=["GET"])
+@require_role("landlord")
+def get_draft_receipt(receipt_id: str):
+    """Return the draft receipt data for the landlord edit form."""
+    doc = _db().collection(RECEIPTS_COLLECTION).document(receipt_id).get()
+    if not doc.exists:
+        return error_response(RECEIPT_NOT_FOUND, "Receipt not found.", status_code=404)
+    receipt = doc.to_dict()
+    receipt["id"] = doc.id
+
+    if receipt.get("landlordId") != g.user["sub"]:
+        return error_response(AUTH_FORBIDDEN, "Access denied.", status_code=403)
+
+    return success_response(data=receipt)
+
+
+@receipts_bp.route("/<receipt_id>/disburse", methods=["PATCH"])
+@require_role("landlord")
+def disburse_receipt(receipt_id: str):
+    """Landlord finalises the receipt draft and disburses it to the tenant.
+
+    Accepts optional field overrides — only the fields the landlord changed
+    need to be sent.  Missing fields keep their draft values.
+    """
+    from marshmallow import ValidationError as MarshmallowValidationError
+    from app.blueprints.receipts.schemas import DisburseReceiptSchema
+    from app.services.receipt_service import ReceiptService
+
+    # Fetch receipt to verify ownership before processing
+    doc = _db().collection(RECEIPTS_COLLECTION).document(receipt_id).get()
+    if not doc.exists:
+        return error_response(RECEIPT_NOT_FOUND, "Receipt not found.", status_code=404)
+    receipt = doc.to_dict()
+    if receipt.get("landlordId") != g.user["sub"]:
+        return error_response(AUTH_FORBIDDEN, "Access denied.", status_code=403)
+    if receipt.get("status") == "disbursed":
+        return error_response(VALIDATION_ERROR, "Receipt has already been disbursed.", status_code=409)
+
+    try:
+        edits = DisburseReceiptSchema().load(request.get_json(silent=True) or {})
+    except MarshmallowValidationError as exc:
+        field = next(iter(exc.messages), None)
+        msg = (
+            exc.messages[field][0]
+            if isinstance(exc.messages.get(field), list)
+            else str(exc.messages)
+        )
+        return error_response(VALIDATION_ERROR, msg, field=field, status_code=422)
+
+    # Strip None values — only override fields the landlord sent
+    edits = {k: v for k, v in edits.items() if v is not None}
+
+    try:
+        final = ReceiptService.disburse_receipt(receipt_id, edits)
+    except ValueError as exc:
+        return error_response(VALIDATION_ERROR, str(exc), status_code=422)
+    except Exception:
+        logger.exception("disburse_receipt failed for receipt_id=%s", receipt_id)
+        return error_response("RECEIPT_ERROR", "Could not disburse receipt.", status_code=500)
+
+    # Notify the tenant
+    try:
+        from app.services.notification_service import NotificationService
+        from app.services.property_service import PropertyService
+        from app.services.tenant_service import TenantService
+
+        tenant = TenantService.get_by_id(receipt.get("tenantId", ""))
+        prop = PropertyService.get_by_id(receipt.get("propertyId", ""))
+        property_name = prop["name"] if prop else "your property"
+        if tenant:
+            NotificationService.notify_payment_approved(
+                tenant_id      = tenant["userId"],
+                payment_id     = final.get("paymentId", ""),
+                property_name  = property_name,
+                receipt_number = final["receiptNumber"],
+                receipt_id     = final["id"],
+            )
+    except Exception as exc:
+        logger.error("Failed to notify tenant after disburse receipt_id=%s: %s", receipt_id, exc)
+
+    return success_response(data=final)

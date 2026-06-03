@@ -196,17 +196,18 @@ class ReceiptService:
             "landlordName":    landlord_user.get("fullName", ""),
             "propertyName":    property_doc.get("name", ""),
             "propertyAddress": property_doc.get("address", ""),
-            "amountPaid":      payment.get("amountClaimed"),
-            "paymentDate":     payment.get("paymentDate"),
-            "paymentMethod":   payment.get("paymentMethod", ""),
-            "referenceNumber": payment.get("referenceNumber", ""),
-            "receiptNumber":   receipt_number,
-            "pdfUrl":          pdf_url,
-            "pdfPublicId":     pdf_public_id,
             "amountPaid":      amount_to_use,
             "amountClaimed":   payment.get("amountClaimed"),
             "amountExtracted": ocr_amount,
+            "paymentDate":     payment.get("paymentDate"),
+            "paymentMethod":   payment.get("paymentMethod", ""),
+            "referenceNumber": payment.get("referenceNumber", ""),
+            "notes":           payment.get("notes", ""),
+            "receiptNumber":   receipt_number,
+            "pdfUrl":          pdf_url,
+            "pdfPublicId":     pdf_public_id,
             "generatedAt":     generated_at,
+            "status":          "disbursed",  # auto-generated receipts are immediately final
             "createdAt":       now,
         }
         doc_ref.set(receipt_data)
@@ -220,6 +221,170 @@ class ReceiptService:
             doc_ref.id, receipt_number, payment_id,
         )
         return receipt_data
+
+    # ── Draft receipt (created immediately after approve) ─────────────────────
+
+    @classmethod
+    def create_draft_receipt(cls, payment_id: str) -> dict:
+        """Create a draft receipt with pre-filled data from the payment.
+
+        The draft is not sent to the tenant and has no PDF yet.
+        The landlord reviews and edits it, then calls disburse_receipt().
+
+        Returns:
+            Draft receipt document dict (includes id, status="draft").
+        """
+        payment = PaymentService.get_by_id(payment_id)
+        if not payment:
+            raise ValueError(f"Payment not found: {payment_id}")
+
+        tenant = TenantService.get_by_id(payment["tenantId"])
+        if not tenant:
+            raise ValueError(f"Tenant not found: {payment['tenantId']}")
+
+        tenant_user = UserService.get_by_id(tenant["userId"])
+        landlord_user = UserService.get_by_id(payment["landlordId"])
+        property_doc = PropertyService.get_by_id(payment["propertyId"])
+
+        receipt_number = cls._generate_receipt_number()
+
+        ocr_amount = payment.get("amountExtracted")
+        amount_to_use = float(ocr_amount) if ocr_amount is not None else float(payment.get("amountClaimed", 0))
+
+        db = cls._db()
+        now = datetime.now(timezone.utc)
+        doc_ref = db.collection(RECEIPTS_COLLECTION).document()
+        receipt_data = {
+            "paymentId":       payment_id,
+            "tenantId":        payment["tenantId"],
+            "landlordId":      payment["landlordId"],
+            "propertyId":      payment["propertyId"],
+            "tenantName":      tenant_user.get("fullName", "") if tenant_user else "",
+            "landlordName":    landlord_user.get("fullName", "") if landlord_user else "",
+            "propertyName":    property_doc.get("name", "") if property_doc else "",
+            "propertyAddress": property_doc.get("address", "") if property_doc else "",
+            "amountPaid":      amount_to_use,
+            "amountClaimed":   payment.get("amountClaimed"),
+            "amountExtracted": ocr_amount,
+            "paymentDate":     payment.get("paymentDate", ""),
+            "paymentMethod":   payment.get("paymentMethod", ""),
+            "referenceNumber": payment.get("referenceNumber", ""),
+            "notes":           payment.get("notes", ""),
+            "periodLabel":     "",   # landlord fills this in (e.g. "January 2025")
+            "receiptNumber":   receipt_number,
+            "pdfUrl":          "",
+            "pdfPublicId":     "",
+            "generatedAt":     now,
+            "status":          "draft",
+            "createdAt":       now,
+        }
+        doc_ref.set(receipt_data)
+        receipt_data["id"] = doc_ref.id
+        PaymentService.set_receipt_id(payment_id, doc_ref.id)
+
+        logger.info(
+            "Draft receipt created: id=%s number=%s payment_id=%s",
+            doc_ref.id, receipt_number, payment_id,
+        )
+        return receipt_data
+
+    # ── Disburse (landlord finalises + sends to tenant) ───────────────────────
+
+    @classmethod
+    def disburse_receipt(cls, receipt_id: str, edits: dict) -> dict:
+        """Apply landlord edits, generate PDF, mark as disbursed.
+
+        Args:
+            receipt_id: Firestore receipt document ID.
+            edits: Dict of overrideable fields (tenantName, amountPaid,
+                   paymentDate, paymentMethod, notes, periodLabel, referenceNumber).
+
+        Returns:
+            Updated receipt dict.
+        """
+        db = cls._db()
+        doc = db.collection(RECEIPTS_COLLECTION).document(receipt_id).get()
+        if not doc.exists:
+            raise ValueError(f"Receipt not found: {receipt_id}")
+
+        receipt = doc.to_dict()
+        receipt["id"] = receipt_id
+
+        if receipt.get("status") == "disbursed":
+            raise ValueError("Receipt has already been disbursed.")
+
+        # Apply edits (only override fields the landlord explicitly provided)
+        allowed_edits = {
+            "tenantName", "amountPaid", "paymentDate",
+            "paymentMethod", "notes", "periodLabel", "referenceNumber",
+        }
+        for field, value in edits.items():
+            if field in allowed_edits and value is not None:
+                receipt[field] = value
+
+        # ── Render HTML + generate PDF ────────────────────────────────────────
+        amount_paid = receipt.get("amountPaid") or 0
+        try:
+            amount_paid = float(amount_paid)
+        except (TypeError, ValueError):
+            amount_paid = 0.0
+
+        template = cls._get_jinja_env().get_template("receipt.html")
+        generated_at = datetime.now(timezone.utc)
+        html_content = template.render(
+            tenantName      = receipt.get("tenantName", ""),
+            landlordName    = receipt.get("landlordName", ""),
+            propertyName    = receipt.get("propertyName", ""),
+            propertyAddress = receipt.get("propertyAddress", ""),
+            amountPaid      = amount_paid,
+            amountClaimed   = receipt.get("amountClaimed"),
+            amountExtracted = receipt.get("amountExtracted"),
+            paymentDate     = receipt.get("paymentDate", ""),
+            paymentMethod   = receipt.get("paymentMethod", ""),
+            referenceNumber = receipt.get("referenceNumber", ""),
+            receiptNumber   = receipt.get("receiptNumber", ""),
+            periodLabel     = receipt.get("periodLabel", ""),
+            notes           = receipt.get("notes", ""),
+            generatedAt     = generated_at.strftime("%Y-%m-%d %H:%M UTC"),
+            isManual        = receipt.get("isManual", False),
+        )
+
+        pdf_bytes = None
+        if _WEASYPRINT_AVAILABLE:
+            try:
+                pdf_bytes = _WeasyHTML(string=html_content).write_pdf()
+            except Exception as wp_exc:
+                logger.warning("WeasyPrint write_pdf() failed: %s", wp_exc)
+
+        pdf_url, pdf_public_id = "", ""
+        if pdf_bytes is not None:
+            upload_result = CloudinaryService.upload_receipt_pdf(
+                pdf_bytes      = pdf_bytes,
+                landlord_id    = receipt["landlordId"],
+                tenant_id      = receipt["tenantId"],
+                receipt_number = receipt["receiptNumber"],
+            )
+            pdf_url       = upload_result["secure_url"]
+            pdf_public_id = upload_result["public_id"]
+
+        # ── Persist final state ───────────────────────────────────────────────
+        now = datetime.now(timezone.utc)
+        updates = {
+            **{k: receipt[k] for k in allowed_edits if k in receipt},
+            "pdfUrl":      pdf_url,
+            "pdfPublicId": pdf_public_id,
+            "generatedAt": generated_at,
+            "status":      "disbursed",
+            "updatedAt":   now,
+        }
+        db.collection(RECEIPTS_COLLECTION).document(receipt_id).update(updates)
+        receipt.update(updates)
+
+        logger.info(
+            "Receipt disbursed: id=%s number=%s",
+            receipt_id, receipt.get("receiptNumber"),
+        )
+        return receipt
 
     # ── Manual / hand-payment receipt ─────────────────────────────────────────
 

@@ -7,7 +7,7 @@ from flask import Blueprint, g, request
 from marshmallow import ValidationError as MarshmallowValidationError
 
 from app.blueprints.payments.schemas import ApprovePaymentSchema, RejectPaymentSchema
-from app.extensions import limiter
+from app.extensions import get_db, limiter
 from app.middleware.auth_middleware import require_auth, require_role
 from app.middleware.rate_limit_middleware import LIMIT_UPLOAD_ENDPOINT, key_by_jwt_sub
 from app.services.cloudinary_service import CloudinaryService
@@ -167,6 +167,109 @@ def submit_payment():
 
 
 
+@payments_bp.route("/calendar", methods=["GET"])
+@require_auth
+def payment_calendar():
+    """Return 12-month payment summary for a tenant.
+
+    Query params:
+        tenantId  — required for landlords; ignored for tenants (own data).
+        year      — YYYY (defaults to current year).
+
+    Response data:
+        months: list of 12 objects {
+            month      — "YYYY-MM",
+            totalPaid  — float,
+            monthlyRent— float,
+            percentage — float (0-100+),
+            status     — "paid" | "partial" | "unpaid",
+            payments   — list of payment summaries,
+        }
+    """
+    from datetime import date
+    from app.services.tenant_service import TenantService
+
+    user = g.user
+    year_str = request.args.get("year", str(date.today().year))
+    try:
+        year = int(year_str)
+    except ValueError:
+        return error_response(VALIDATION_ERROR, "year must be a 4-digit integer.", status_code=422)
+
+    # ── Resolve tenant record ─────────────────────────────────────────────────
+    if user["role"] == "landlord":
+        tenant_id = request.args.get("tenantId", "").strip()
+        if not tenant_id:
+            return error_response(VALIDATION_ERROR, "tenantId is required.", field="tenantId", status_code=422)
+        tenant = TenantService.get_by_id(tenant_id)
+        if not tenant or tenant.get("landlordId") != user["sub"]:
+            return error_response(AUTH_FORBIDDEN, "Tenant not found or not yours.", status_code=403)
+    else:
+        # Tenant can only see their own calendar
+        tenant = TenantService.get_by_user_id(user["sub"])
+        if not tenant:
+            return error_response(AUTH_FORBIDDEN, "No active tenant record found.", status_code=403)
+        tenant_id = tenant["id"]
+
+    monthly_rent = float(tenant.get("monthlyRent", 0) or 0)
+
+    # ── Fetch all payments for this tenant, filter approved in Python ──────────
+    # We query by tenantId alone to avoid requiring a composite Firestore index.
+    # Status and year filtering is done in Python — consistent with how the rest
+    # of the app avoids composite-index requirements.
+    raw_docs = (
+        get_db()
+        .collection("payments")
+        .where("tenantId", "==", tenant_id)
+        .stream()
+    )
+
+    # Build a dict: "YYYY-MM" → list of payment dicts
+    month_map: dict = {f"{year}-{str(m).zfill(2)}": [] for m in range(1, 13)}
+    for doc in raw_docs:
+        p = doc.to_dict()
+        if p.get("status") != "approved":
+            continue
+        payment_date = str(p.get("paymentDate", ""))
+        if payment_date.startswith(str(year)):
+            ym = payment_date[:7]   # "YYYY-MM"
+            if ym in month_map:
+                month_map[ym].append({
+                    "id":            doc.id,
+                    "amountPaid":    float(p.get("amountClaimed", 0) or 0),
+                    "paymentDate":   payment_date,
+                    "paymentMethod": p.get("paymentMethod", ""),
+                })
+
+    # ── Build response ─────────────────────────────────────────────────────────
+    months = []
+    for month_key in sorted(month_map.keys()):
+        payments = month_map[month_key]
+        total_paid = sum(x["amountPaid"] for x in payments)
+        if monthly_rent > 0:
+            pct = min(round(total_paid / monthly_rent * 100, 1), 200)
+        else:
+            pct = 0.0
+
+        if total_paid <= 0:
+            status = "unpaid"
+        elif pct >= 100:
+            status = "paid"
+        else:
+            status = "partial"
+
+        months.append({
+            "month":       month_key,
+            "totalPaid":   total_paid,
+            "monthlyRent": monthly_rent,
+            "percentage":  pct,
+            "status":      status,
+            "payments":    payments,
+        })
+
+    return success_response(data={"year": year, "months": months, "monthlyRent": monthly_rent})
+
+
 @payments_bp.route("", methods=["GET"])
 @require_auth
 def list_payments():
@@ -213,38 +316,25 @@ def approve_payment(payment_id: str):
 
     PaymentService.approve(payment_id, landlord_note=data.get("note"))
 
-    # Generate receipt inline (synchronous) now that the payment is approved.
-    # The receipt service handles WeasyPrint unavailability gracefully.
+    # Create a draft receipt that the landlord can review/edit before disbursing.
     receipt = None
     try:
         from app.services.receipt_service import ReceiptService
-        receipt = ReceiptService.generate_receipt(payment_id)
-        logger.info("Receipt generated: id=%s payment_id=%s", receipt.get("id"), payment_id)
+        receipt = ReceiptService.create_draft_receipt(payment_id)
+        logger.info("Draft receipt created: id=%s payment_id=%s", receipt.get("id"), payment_id)
     except Exception:
         logger.exception(
-            "Receipt generation failed for payment_id=%s — payment remains approved "
-            "but no receipt record was created.",
+            "Draft receipt creation failed for payment_id=%s — payment remains approved.",
             payment_id,
         )
 
-    # Notify tenant — include receipt details if available
-    try:
-        from app.services.property_service import PropertyService
-        prop = PropertyService.get_by_id(payment["propertyId"])
-        property_name = prop["name"] if prop else "your property"
-        NotificationService.notify_payment_approved(
-            tenant_id      = payment["userId"],
-            payment_id     = payment_id,
-            property_name  = property_name,
-            receipt_number = receipt["receiptNumber"] if receipt else "N/A",
-            receipt_id     = receipt["id"] if receipt else "",
-        )
-    except Exception as exc:
-        logger.error("Failed to notify tenant for payment_id=%s: %s", payment_id, exc)
-
     return success_response(
-        data={"paymentId": payment_id, "receiptId": receipt["id"] if receipt else None},
-        message="Payment approved and receipt generated.",
+        data={
+            "paymentId":  payment_id,
+            "receiptId":  receipt["id"] if receipt else None,
+            "receiptNumber": receipt["receiptNumber"] if receipt else None,
+        },
+        message="Payment approved. Please edit and disburse the receipt.",
     )
 
 

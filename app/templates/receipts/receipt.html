@@ -210,7 +210,6 @@
     <div class="prop-address">{{ propertyAddress }}</div>
   </div>
 
-  <!-- Payment Details -->
   <div class="section-label">Payment Details</div>
   <table>
     <thead>
@@ -222,8 +221,14 @@
     <tbody>
       <tr class="amount-row">
         <td>Amount Paid</td>
-        <td><span class="amount-value">{{ amountPaid }}</span></td>
+        <td><span class="amount-value">{{ amountPaid | int | string if amountPaid == (amountPaid | int) else amountPaid }}</span></td>
       </tr>
+      {% if periodLabel %}
+      <tr>
+        <td>Rent Period</td>
+        <td>{{ periodLabel }}</td>
+      </tr>
+      {% endif %}
       <tr>
         <td>Payment Date</td>
         <td>{{ paymentDate }}</td>
@@ -242,8 +247,21 @@
         <td>Receipt Number</td>
         <td>{{ receiptNumber }}</td>
       </tr>
+      {% if isManual %}
+      <tr>
+        <td>Payment Type</td>
+        <td>Manual / Cash Payment</td>
+      </tr>
+      {% endif %}
     </tbody>
   </table>
+
+  {% if notes %}
+  <div class="section-label">Notes</div>
+  <div class="property-block" style="margin-bottom: 30px;">
+    <p style="font-size: 10pt; color: #444; line-height: 1.6;">{{ notes }}</p>
+  </div>
+  {% endif %}
 
   <!-- Footer -->
   <div class="footer">
