@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import { Router, Request, Response } from 'express';
 import { listingService } from '../services/listing.service.js';
 import { paginated, success, error } from '../utils/response.js';
 import { requireAuth, requireRole } from '../middleware/auth.js';
@@ -7,7 +7,7 @@ import { uploadToSupabase } from '../utils/uploadToSupabase.js';
 
 export const listingsRouter = Router();
 
-listingsRouter.get('/', async (req, res) => {
+listingsRouter.get('/', async (req: Request, res: Response) => {
   try {
     const params = {
       page: req.query.page ? parseInt(req.query.page as string, 10) : undefined,
@@ -19,7 +19,6 @@ listingsRouter.get('/', async (req, res) => {
       maxDistanceKm: req.query.maxDistanceKm ? parseFloat(req.query.maxDistanceKm as string) : undefined,
       sort: req.query.sort as any,
     };
-
     const result = await listingService.browse(params);
     return paginated(res, result.data, result.pagination);
   } catch (err: any) {
@@ -27,7 +26,7 @@ listingsRouter.get('/', async (req, res) => {
   }
 });
 
-listingsRouter.get('/my', requireAuth, requireRole('landlord', 'admin'), async (req, res) => {
+listingsRouter.get('/my', requireAuth, requireRole('landlord', 'admin'), async (req: Request, res: Response) => {
   try {
     const status = req.query.status as string | undefined;
     const listings = await listingService.getMyListings(req.user!.sub, status);
@@ -42,7 +41,7 @@ listingsRouter.post(
   requireAuth,
   requireRole('landlord', 'admin'),
   upload.fields([{ name: 'exteriorImages', maxCount: 8 }, { name: 'roomImages', maxCount: 8 }]),
-  async (req, res) => {
+  async (req: Request, res: Response) => {
     try {
       const files = req.files as { [fieldname: string]: Express.Multer.File[] };
 
@@ -50,7 +49,6 @@ listingsRouter.post(
         return error(res, 'At least one exterior image is required', 400);
       }
 
-      // Upload all images to Supabase Storage in parallel
       const uploadResults = await Promise.all([
         ...(files.exteriorImages ?? []).map((f) =>
           uploadToSupabase(f, 'listing-images', 'exterior').then((r) => ({ ...r, category: 'exterior' }))
@@ -69,7 +67,7 @@ listingsRouter.post(
   }
 );
 
-listingsRouter.get('/:id', async (req, res) => {
+listingsRouter.get('/:id', async (req: Request, res: Response) => {
   try {
     const listing = await listingService.getById(req.params.id);
     if (!listing) return error(res, 'Listing not found', 404);
@@ -85,9 +83,8 @@ listingsRouter.put(
   requireAuth,
   requireRole('landlord', 'admin'),
   upload.fields([{ name: 'exteriorImages', maxCount: 8 }, { name: 'roomImages', maxCount: 8 }]),
-  async (req, res) => {
+  async (req: Request, res: Response) => {
     try {
-      // Verify ownership
       const existing = await listingService.getById(req.params.id);
       if (!existing) return error(res, 'Listing not found', 404);
       if (req.user!.role !== 'admin' && existing.landlordId !== req.user!.sub) {
@@ -124,7 +121,7 @@ listingsRouter.put(
 );
 
 // DELETE /api/listings/:id — soft-delete (sets status to 'deactivated')
-listingsRouter.delete('/:id', requireAuth, requireRole('landlord', 'admin'), async (req, res) => {
+listingsRouter.delete('/:id', requireAuth, requireRole('landlord', 'admin'), async (req: Request, res: Response) => {
   try {
     const existing = await listingService.getById(req.params.id);
     if (!existing) return error(res, 'Listing not found', 404);
