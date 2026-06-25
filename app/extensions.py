@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------
-# extensions.py — Initialise Flask extensions (limiter, Firestore, Cloudinary, Firebase Admin)
+# extensions.py — Initialise Flask extensions (NjangaRent)
 # ---------------------------------------------------------------------------
 import os
 import logging
@@ -9,6 +9,7 @@ import firebase_admin
 from firebase_admin import credentials, firestore, messaging  # noqa: F401
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+from flask_socketio import SocketIO
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,9 @@ limiter = Limiter(
     storage_uri=_get_redis_url(),
     swallow_errors=True,
 )
+
+# Flask-SocketIO singleton — init_app() called in app/__init__.py
+socketio = SocketIO()
 
 # ── Firestore client (module-level singleton) ─────────────────────────────────
 _firebase_app = None

@@ -166,24 +166,28 @@ def submit_payment():
     )
 
 
-
 @payments_bp.route("/calendar", methods=["GET"])
 @require_auth
 def payment_calendar():
-    """Return 12-month payment summary for a tenant.
+    """Return 12-month payment summary for a tenant using waterfall allocation.
 
     Query params:
         tenantId  — required for landlords; ignored for tenants (own data).
         year      — YYYY (defaults to current year).
 
+    Waterfall allocation:
+        All approved payments are pooled in chronological order and allocated
+        month-by-month (Jan→Dec).  A ₦170k payment against ₦50k/month rent
+        fills 3 full months + leaves ₦20k in a partial 4th month.
+
     Response data:
         months: list of 12 objects {
             month      — "YYYY-MM",
-            totalPaid  — float,
+            totalPaid  — float  (amount allocated to this month),
             monthlyRent— float,
-            percentage — float (0-100+),
+            percentage — float (0-100),
             status     — "paid" | "partial" | "unpaid",
-            payments   — list of payment summaries,
+            payments   — list of payment summaries dated in this month,
         }
     """
     from datetime import date
@@ -213,10 +217,9 @@ def payment_calendar():
 
     monthly_rent = float(tenant.get("monthlyRent", 0) or 0)
 
-    # ── Fetch all payments for this tenant, filter approved in Python ──────────
-    # We query by tenantId alone to avoid requiring a composite Firestore index.
-    # Status and year filtering is done in Python — consistent with how the rest
-    # of the app avoids composite-index requirements.
+    # ── Fetch all approved payments for this tenant ───────────────────────────
+    # Query by tenantId only — avoids composite Firestore index requirements.
+    # Year and status filtering happen in Python.
     raw_docs = (
         get_db()
         .collection("payments")
@@ -224,43 +227,68 @@ def payment_calendar():
         .stream()
     )
 
-    # Build a dict: "YYYY-MM" → list of payment dicts
-    month_map: dict = {f"{year}-{str(m).zfill(2)}": [] for m in range(1, 13)}
+    # Collect approved payments for this year, sorted by payment date ascending.
+    year_payments = []
     for doc in raw_docs:
         p = doc.to_dict()
         if p.get("status") != "approved":
             continue
         payment_date = str(p.get("paymentDate", ""))
         if payment_date.startswith(str(year)):
-            ym = payment_date[:7]   # "YYYY-MM"
-            if ym in month_map:
-                month_map[ym].append({
-                    "id":            doc.id,
-                    "amountPaid":    float(p.get("amountClaimed", 0) or 0),
-                    "paymentDate":   payment_date,
-                    "paymentMethod": p.get("paymentMethod", ""),
-                })
+            year_payments.append({
+                "id":            doc.id,
+                "amountPaid":    float(p.get("amountClaimed", 0) or 0),
+                "paymentDate":   payment_date,
+                "paymentMethod": p.get("paymentMethod", ""),
+            })
 
-    # ── Build response ─────────────────────────────────────────────────────────
+    year_payments.sort(key=lambda x: x["paymentDate"])
+
+    # ── Group payments by their month (for tooltip attribution) ───────────────
+    payment_by_month: dict = {f"{year}-{str(m).zfill(2)}": [] for m in range(1, 13)}
+    for p in year_payments:
+        ym = p["paymentDate"][:7]
+        if ym in payment_by_month:
+            payment_by_month[ym].append(p)
+
+    # ── Waterfall allocation ───────────────────────────────────────────────────
+    # Running balance accumulates as payments arrive (by their dated month).
+    # Each month deducts up to monthlyRent from the balance.
+    balance = 0.0
     months = []
-    for month_key in sorted(month_map.keys()):
-        payments = month_map[month_key]
-        total_paid = sum(x["amountPaid"] for x in payments)
-        if monthly_rent > 0:
-            pct = min(round(total_paid / monthly_rent * 100, 1), 200)
-        else:
-            pct = 0.0
 
-        if total_paid <= 0:
-            status = "unpaid"
-        elif pct >= 100:
-            status = "paid"
+    for m in range(1, 13):
+        month_key = f"{year}-{str(m).zfill(2)}"
+        month_payments = payment_by_month[month_key]
+
+        # Add this month's payments to the running balance pool
+        for p in month_payments:
+            balance += p["amountPaid"]
+
+        # Allocate from balance for this month
+        if monthly_rent <= 0:
+            # No rent configured — show raw payment totals, no allocation
+            total_allocated = sum(p["amountPaid"] for p in month_payments)
+            pct    = 0.0
+            status = "unpaid" if total_allocated <= 0 else "partial"
+        elif balance >= monthly_rent:
+            total_allocated = monthly_rent
+            balance        -= monthly_rent
+            pct             = 100.0
+            status          = "paid"
+        elif balance > 0:
+            total_allocated = balance
+            balance         = 0.0
+            pct             = round(total_allocated / monthly_rent * 100, 1)
+            status          = "partial"
         else:
-            status = "partial"
+            total_allocated = 0.0
+            pct             = 0.0
+            status          = "unpaid"
 
         months.append({
             "month":       month_key,
-            "totalPaid":   total_paid,
+            "totalPaid":   round(total_allocated, 2),
             "monthlyRent": monthly_rent,
             "percentage":  pct,
             "status":      status,

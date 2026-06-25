@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------
-# blueprints/auth/routes.py — All /auth/* endpoints
+# blueprints/auth/routes.py — All /auth/* endpoints (NjangaRent extended)
 # ---------------------------------------------------------------------------
 import hashlib
 import logging
@@ -17,6 +17,7 @@ from app.blueprints.auth.schemas import (
     GoogleAuthSchema,
     InviteCompleteSchema,
     LoginSchema,
+    NjangaRentSignupSchema,
     ResetPasswordSchema,
     SignupSchema,
 )
@@ -24,6 +25,7 @@ from app.extensions import limiter
 from app.middleware.auth_middleware import require_auth
 from app.middleware.rate_limit_middleware import LIMIT_AUTH_ENDPOINTS, key_by_ip
 from app.services.auth_service import AuthService
+from app.services.cloudinary_service import CloudinaryService
 from app.services.invite_service import InviteService
 from app.services.property_service import PropertyService
 from app.services.tenant_service import TenantService
@@ -38,8 +40,11 @@ from app.utils.constants import (
     AUTH_TOKEN_EXPIRED,
     AUTH_TOKEN_INVALID,
     ROLE_LANDLORD,
+    ROLE_STUDENT,
     ROLE_TENANT,
     SERVER_ERROR,
+    STATUS_PENDING,
+    STATUS_ACTIVE,
     USER_NOT_FOUND,
     VALIDATION_ERROR,
 )
@@ -105,14 +110,77 @@ class _ValidationFail(Exception):
 @auth_bp.route("/signup", methods=["POST"])
 @limiter.limit(LIMIT_AUTH_ENDPOINTS, key_func=key_by_ip)
 def signup():
+    """NjangaRent self-registration endpoint.
+
+    Accepts multipart/form-data (for file uploads) OR application/json (legacy).
+    New registrations create accounts with status=PENDING — admin must approve.
+    """
+    # Parse form data (multipart) or JSON
+    if request.content_type and "multipart" in request.content_type:
+        raw = request.form.to_dict()
+        files = request.files
+    else:
+        raw = request.get_json(silent=True) or {}
+        files = {}
+
     try:
-        data = _validate(SignupSchema, request.get_json(silent=True) or {})
+        data = _validate(NjangaRentSignupSchema, raw)
     except _ValidationFail as e:
         return error_response(VALIDATION_ERROR, e.message, field=e.field, status_code=422)
+
+    role = data.get("role", ROLE_LANDLORD)
+
+    # Landlord requires phone
+    if role == ROLE_LANDLORD and not data.get("phone"):
+        return error_response(VALIDATION_ERROR, "Phone number is required for landlord registration.", field="phone", status_code=422)
+
+    # Student requires matric number
+    if role == ROLE_STUDENT and not data.get("matricNumber"):
+        return error_response(VALIDATION_ERROR, "Matriculation number is required for student registration.", field="matricNumber", status_code=422)
 
     # Check email uniqueness
     if UserService.get_by_email(data["email"]):
         return error_response(AUTH_EMAIL_EXISTS, "An account with this email already exists.", status_code=409)
+
+    # Upload verification documents to Cloudinary
+    verification = {}
+    try:
+        _cs = CloudinaryService()
+        if role == ROLE_STUDENT:
+            if "studentIdImage" in files:
+                result = _cs.upload_image(
+                    files["studentIdImage"],
+                    folder="njangrent/verifications/students",
+                )
+                verification["studentIdUrl"] = result["secure_url"]
+            if "admissionLetter" in files:
+                result = _cs.upload_image(
+                    files["admissionLetter"],
+                    folder="njangrent/verifications/students",
+                )
+                verification["admissionLetterUrl"] = result["secure_url"]
+        else:  # landlord
+            if "nationalIdFront" in files:
+                result = _cs.upload_image(
+                    files["nationalIdFront"],
+                    folder="njangrent/verifications/landlords",
+                )
+                verification["nationalIdFrontUrl"] = result["secure_url"]
+            if "nationalIdBack" in files:
+                result = _cs.upload_image(
+                    files["nationalIdBack"],
+                    folder="njangrent/verifications/landlords",
+                )
+                verification["nationalIdBackUrl"] = result["secure_url"]
+            if "ownershipDoc" in files:
+                result = _cs.upload_image(
+                    files["ownershipDoc"],
+                    folder="njangrent/verifications/landlords",
+                )
+                verification["ownershipDocUrl"] = result["secure_url"]
+    except Exception as exc:
+        logger.error("Verification document upload failed during signup: %s", exc)
+        # Continue without docs — admin will request them
 
     # Hash password
     pw_hash = bcrypt.hashpw(data["password"].encode(), bcrypt.gensalt(rounds=12)).decode()
@@ -120,11 +188,26 @@ def signup():
     user = UserService.create(
         email         = data["email"],
         full_name     = data["fullName"],
-        role          = ROLE_LANDLORD,
+        role          = role,
         password_hash = pw_hash,
         phone         = data.get("phone"),
+        status        = STATUS_PENDING,  # All new accounts start as PENDING
+        university    = data.get("university") if role == ROLE_STUDENT else None,
+        program       = data.get("program") if role == ROLE_STUDENT else None,
+        matric_number = data.get("matricNumber") if role == ROLE_STUDENT else None,
+        verification  = verification if verification else None,
     )
-    return _issue_tokens_response(user, status_code=201)
+
+    # Return user data without issuing tokens (PENDING cannot access protected routes)
+    from app.utils.response import success_response as _success
+    return _success(
+        data={
+            "user": UserService.safe_dict(user),
+            "pendingVerification": True,
+            "message": "Account created. Please wait for admin approval before logging in.",
+        },
+        status_code=201,
+    )
 
 
 @auth_bp.route("/login", methods=["POST"])
@@ -141,6 +224,28 @@ def login():
 
     if not bcrypt.checkpw(data["password"].encode(), user["passwordHash"].encode()):
         return error_response(AUTH_INVALID_CREDENTIALS, "Invalid email or password.", status_code=401)
+
+    # PENDING / REJECTED / BANNED — return user info with status flag (no tokens)
+    account_status = user.get("status", STATUS_ACTIVE)
+    if account_status == STATUS_PENDING:
+        return success_response(
+            data={
+                "user": UserService.safe_dict(user),
+                "pendingVerification": True,
+                "accessToken": None,
+            },
+            message="Your account is pending admin verification.",
+        )
+    if account_status in ("REJECTED", "BANNED"):
+        return success_response(
+            data={
+                "user": UserService.safe_dict(user),
+                "pendingVerification": True,
+                "accountStatus": account_status,
+                "accessToken": None,
+            },
+            message=f"Account {account_status.lower()}. Contact support for assistance.",
+        )
 
     return _issue_tokens_response(user)
 

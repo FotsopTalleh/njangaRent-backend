@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------
-# app/__init__.py — Flask application factory
+# app/__init__.py — Flask application factory (NjangaRent)
 # ---------------------------------------------------------------------------
 import logging
 import os
@@ -7,6 +7,7 @@ import os
 from dotenv import load_dotenv
 from flask import Flask
 from flask_cors import CORS
+from flask_socketio import SocketIO
 
 load_dotenv()  # Load .env before anything else
 
@@ -78,11 +79,10 @@ def create_app(config_override=None) -> Flask:
     _frontend = app.config.get("FRONTEND_URL", "http://localhost:3000")
     _cors_origins = list({
         _frontend,
-        # Common Vite / TanStack dev server ports
         "http://localhost:3000",
         "http://localhost:5173",
         "http://localhost:4173",
-        "http://localhost:8080",   # @lovable.dev/vite-tanstack-config default
+        "http://localhost:8080",
         "http://127.0.0.1:3000",
         "http://127.0.0.1:5173",
         "http://127.0.0.1:8080",
@@ -95,7 +95,21 @@ def create_app(config_override=None) -> Flask:
         allow_headers=["Authorization", "Content-Type", "X-N8N-Secret", "X-Internal-Secret"],
     )
 
+    # ── Flask-SocketIO (NjangaRent real-time chat) ────────────────────────────
+    from app.extensions import socketio
+    socketio.init_app(
+        app,
+        cors_allowed_origins=_cors_origins,
+        async_mode="eventlet",
+        logger=False,
+        engineio_logger=False,
+    )
+    # Register Socket.io event handlers
+    from app.sockets.chat import register_handlers
+    register_handlers(socketio)
+
     # ── Blueprints ────────────────────────────────────────────────────────────
+    # Original MyTenant blueprints
     from app.blueprints.auth.routes         import auth_bp
     from app.blueprints.notifications.routes import notifications_bp
     from app.blueprints.payments.routes     import payments_bp
@@ -103,6 +117,12 @@ def create_app(config_override=None) -> Flask:
     from app.blueprints.receipts.routes     import receipts_bp
     from app.blueprints.tenants.routes      import tenants_bp
     from app.blueprints.webhooks.routes     import webhooks_bp
+    # NjangaRent new blueprints
+    from app.blueprints.listings.routes     import listings_bp
+    from app.blueprints.messages.routes     import messages_bp
+    from app.blueprints.appointments.routes import appointments_bp
+    from app.blueprints.nkwa_payments.routes import nkwa_bp
+    from app.blueprints.admin.routes        import admin_bp
 
     app.register_blueprint(auth_bp)
     app.register_blueprint(properties_bp)
@@ -111,6 +131,11 @@ def create_app(config_override=None) -> Flask:
     app.register_blueprint(receipts_bp)
     app.register_blueprint(notifications_bp)
     app.register_blueprint(webhooks_bp)
+    app.register_blueprint(listings_bp)
+    app.register_blueprint(messages_bp)
+    app.register_blueprint(appointments_bp)
+    app.register_blueprint(nkwa_bp)
+    app.register_blueprint(admin_bp)
 
     # ── Health check ──────────────────────────────────────────────────────────
     @app.route("/health", methods=["GET"])
@@ -123,7 +148,7 @@ def create_app(config_override=None) -> Flask:
     register_error_handlers(app)
 
     app.logger.info(
-        "MyTenant backend started [env=%s debug=%s]",
+        "NjangaRent backend started [env=%s debug=%s]",
         os.environ.get("FLASK_ENV", "development"),
         app.config.get("DEBUG"),
     )
