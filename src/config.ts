@@ -45,6 +45,15 @@ export const config = {
     serviceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY ?? '',
   },
 
+  campay: {
+    baseUrl:        process.env.CAMPAY_BASE_URL         ?? 'https://campay.net/api',
+    appId:          process.env.CAMPAY_APP_ID           ?? '',
+    appUsername:    process.env.CAMPAY_APP_USERNAME      ?? '',
+    appPassword:    process.env.CAMPAY_APP_PASSWORD      ?? '',
+    permanentToken: process.env.CAMPAY_PERMANENT_TOKEN   ?? '',
+    webhookKey:     process.env.CAMPAY_WEBHOOK_KEY       ?? '',
+  },
+
   isDev:  () => config.nodeEnv === 'development',
   isProd: () => config.nodeEnv === 'production',
 };
