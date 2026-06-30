@@ -129,10 +129,17 @@ export const campayService = {
         return { paymentId, reference, ussd_code, operator, status: 'pending' };
 
       } catch (err: any) {
-        const errMsg = err.response?.data?.detail
-          ?? err.response?.data?.message
+        const errMsg = err.response?.data?.message
+          ?? err.response?.data?.detail
+          ?? err.response?.data?.error
           ?? err.message
           ?? 'Payment initiation failed';
+
+        // Surface demo-mode limit clearly
+        const isDemoLimit = errMsg.toLowerCase().includes('demo') || errMsg.toLowerCase().includes('maximum amount');
+        const userMessage = isDemoLimit
+          ? `Demo mode: CamPay limits collections to 25 XAF. Switch CAMPAY_BASE_URL to https://campay.net/api for live payments.`
+          : errMsg;
 
         console.error('[Campay] collect error:', err.response?.data ?? err.message);
 
@@ -141,7 +148,7 @@ export const campayService = {
           [paymentId],
         );
 
-        return { paymentId, reference: null, status: 'failed', error: errMsg };
+        return { paymentId, reference: null, status: 'failed', error: userMessage };
       }
     }
 
@@ -275,6 +282,13 @@ export const campayService = {
     description: string;
     paymentId:   string;   // our internal campay_payment id, used as external_reference
   }): Promise<void> {
+    // Skip disburse entirely on demo environment (endpoint doesn't exist)
+    const isDemo = config.campay.baseUrl.includes('demo.campay.net');
+    if (isDemo) {
+      console.info('[campay] Demo mode — skipping disburse to landlord (not available in sandbox)');
+      return;
+    }
+
     // Fetch landlord's phone from DB
     const landlordRes = await query(
       `SELECT phone, full_name FROM users WHERE id = $1`,
