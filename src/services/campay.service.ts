@@ -246,9 +246,64 @@ export const campayService = {
           ]
         );
       }
+
+      // Auto-disburse to landlord's registered phone number
+      try {
+        await campayService.disburseToLandlord({
+          landlordId:  payment.landlord_id,
+          amount:      Number(payment.amount),
+          description: `NjangaRent rent payment disbursement`,
+          paymentId:   payment.id,
+        });
+      } catch (disbErr: any) {
+        // Non-fatal — log but don't fail the webhook
+        console.warn('[campay] disburse to landlord failed (payout may not be enabled):', disbErr.message);
+      }
     }
 
     return { updated: result.rowCount ?? 0 };
+  },
+
+  /**
+   * Disburse (transfer) funds to the landlord's registered phone number.
+   * Requires CamPay payout/disburse to be enabled on your account.
+   * Gracefully skips if landlord has no phone number on file.
+   */
+  async disburseToLandlord(params: {
+    landlordId:  string;
+    amount:      number;
+    description: string;
+    paymentId:   string;   // our internal campay_payment id, used as external_reference
+  }): Promise<void> {
+    // Fetch landlord's phone from DB
+    const landlordRes = await query(
+      `SELECT phone, full_name FROM users WHERE id = $1`,
+      [params.landlordId]
+    );
+    const landlord = landlordRes.rows[0];
+    if (!landlord?.phone) {
+      console.warn(`[campay] Landlord ${params.landlordId} has no phone — skipping disburse`);
+      return;
+    }
+
+    // Normalize phone to 237XXXXXXXXX
+    const rawPhone = String(landlord.phone).replace(/^\+/, '').replace(/\s/g, '');
+    const normPhone = rawPhone.startsWith('237') ? rawPhone : `237${rawPhone}`;
+
+    // CamPay /transfer/ (disburse) endpoint
+    // Docs: https://campay.net/api/docs/#tag/Transfer
+    const response = await campayClient.post('/transfer/', {
+      amount:             String(params.amount),
+      currency:           'XAF',
+      to:                 normPhone,
+      description:        params.description,
+      external_reference: `DISB_${params.paymentId}`,
+    });
+
+    console.info(
+      `[campay] Disbursed ${params.amount} XAF to landlord ${landlord.full_name} (${normPhone}):`,
+      response.data
+    );
   },
 
   /**

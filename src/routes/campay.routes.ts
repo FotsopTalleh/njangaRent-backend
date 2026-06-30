@@ -38,6 +38,47 @@ campayRouter.post('/webhook', async (req: Request, res: Response) => {
 campayRouter.use(requireAuth);
 
 /**
+ * GET /api/campay/listing-info/:listingId
+ * Returns listing title, rent amount, and landlord's name + masked phone.
+ * Used by the pay page to show the student who they're paying.
+ */
+campayRouter.get('/listing-info/:listingId', async (req: Request, res: Response) => {
+  try {
+    const { pool } = await import('../db/pool.js');
+    const result = await pool.query(
+      `SELECT l.id, l.title, l.rent_amount, l.display_address,
+              u.full_name AS landlord_name, u.phone AS landlord_phone, u.id AS landlord_id
+       FROM listings l
+       JOIN users u ON u.id = l.landlord_id
+       WHERE l.id = $1`,
+      [req.params.listingId]
+    );
+    if (!result.rows.length) return error(res, 'Listing not found', 404);
+
+    const row = result.rows[0];
+    // Mask the phone — show first 3 and last 2 digits e.g. 670XXXX45
+    const rawPhone: string = (row.landlord_phone ?? '').replace(/^\+?237/, '').replace(/\s/g, '');
+    const maskedPhone = rawPhone.length >= 5
+      ? `+237 ${rawPhone.slice(0, 3)}${'X'.repeat(rawPhone.length - 5)}${rawPhone.slice(-2)}`
+      : row.landlord_phone ?? 'N/A';
+
+    return success(res, {
+      listingId:      row.id,
+      title:          row.title,
+      rentAmount:     row.rent_amount,
+      displayAddress: row.display_address,
+      landlordId:     row.landlord_id,
+      landlordName:   row.landlord_name,
+      landlordPhone:  maskedPhone,        // masked for privacy
+    });
+  } catch (err: any) {
+    return error(res, err.message, 500);
+  }
+});
+
+
+
+/**
  * POST /api/campay/pay
  * Initiate a MoMo collection (student or tenant pays).
  * Body: { phoneNumber, amount, description, landlordId, listingId?, paymentType }
