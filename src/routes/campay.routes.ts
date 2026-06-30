@@ -53,8 +53,23 @@ campayRouter.post('/pay', async (req: Request, res: Response) => {
       paymentType,
     } = req.body;
 
-    if (!phoneNumber || !amount || !landlordId) {
-      return error(res, 'phoneNumber, amount, and landlordId are required', 400);
+    if (!phoneNumber || !amount) {
+      return error(res, 'phoneNumber and amount are required', 400);
+    }
+
+    let finalLandlordId = landlordId;
+    
+    // Deduce landlordId from listingId if not provided
+    if (!finalLandlordId && listingId) {
+      const { pool } = await import('../db/pool.js');
+      const listingRes = await pool.query(`SELECT landlord_id FROM listings WHERE id = $1`, [listingId]);
+      if (listingRes.rows.length > 0) {
+        finalLandlordId = listingRes.rows[0].landlord_id;
+      }
+    }
+
+    if (!finalLandlordId) {
+      return error(res, 'landlordId is required, or provide a valid listingId to deduce it', 400);
     }
 
     // Normalise phone number — ensure it starts with 237
@@ -66,7 +81,7 @@ campayRouter.post('/pay', async (req: Request, res: Response) => {
       amount:       Number(amount),
       description:  description ?? 'NjangaRent Payment',
       payerId:      req.user!.sub,
-      landlordId,
+      landlordId:   finalLandlordId,
       listingId,
       paymentType:  paymentType ?? 'rent',
     });
@@ -96,6 +111,16 @@ campayRouter.get('/status/:reference', async (req: Request, res: Response) => {
   try {
     const txn = await campayService.getTransactionStatus(req.params.reference);
     if (!txn) return error(res, 'Transaction not found or unreachable', 404);
+    
+    // Sync to DB locally since webhooks might not arrive in dev or might be delayed
+    if (txn.status === 'SUCCESSFUL' || txn.status === 'FAILED') {
+      await campayService.handleWebhook({
+        reference: txn.reference,
+        status: txn.status,
+        amount: txn.amount,
+      });
+    }
+
     return success(res, txn);
   } catch (err: any) {
     return error(res, err.message, 500);

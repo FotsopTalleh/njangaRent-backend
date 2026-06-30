@@ -22,42 +22,56 @@ receiptsRouter.get('/', async (req, res) => {
       params.push(req.user!.sub);
       conditions.push(`r.landlord_id = $${params.length}`);
     } else {
-      // Tenant: find by user_id → tenants.id
+      // Tenant: find by user_id → tenants.id, or directly from campay_payments.payer_id
       const tenantRes = await query(
-        'SELECT id FROM tenants WHERE user_id = $1 AND status = $2 LIMIT 1',
+        'SELECT id FROM tenants WHERE user_id = $1 AND status = $2',
         [req.user!.sub, 'active'],
       );
-      if (tenantRes.rows.length) {
-        params.push(tenantRes.rows[0].id);
-        conditions.push(`r.tenant_id = $${params.length}`);
+      
+      let tenantCond = 'FALSE';
+      if (tenantRes.rows.length > 0) {
+        // Build a dynamic IN clause or safely use an array
+        const ids = tenantRes.rows.map(row => `'${row.id}'`).join(',');
+        tenantCond = `r.tenant_id IN (${ids})`;
       }
+      
+      params.push(req.user!.sub);
+      conditions.push(`(${tenantCond} OR cp.payer_id = $${params.length})`);
     }
 
     if (propertyId) {
       params.push(propertyId);
+      // Property filter applies to both legacy property_id and campay listing_id (though listing_id != property_id, we just filter by property_id if provided)
       conditions.push(`r.property_id = $${params.length}`);
     }
 
     const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
 
-    const countRes = await query(`SELECT COUNT(*) FROM receipts r ${where}`, params);
-    const total = parseInt(countRes.rows[0].count);
-
-    const rows = await query(
-      `SELECT r.*,
-              ut.full_name AS tenant_name,
-              ul.full_name AS landlord_name,
-              p.name AS property_name,
-              p.address AS property_address,
-              rp.payment_method,
-              rp.reference_number,
-              rp.notes
+    const fromClause = `
        FROM receipts r
        LEFT JOIN tenants t  ON t.id = r.tenant_id
        LEFT JOIN users ut   ON ut.id = t.user_id
        LEFT JOIN users ul   ON ul.id = r.landlord_id
        LEFT JOIN properties p ON p.id = r.property_id
        LEFT JOIN rent_payments rp ON rp.id = r.payment_id
+       LEFT JOIN campay_payments cp ON cp.id = r.campay_payment_id
+       LEFT JOIN users ucp  ON ucp.id = cp.payer_id
+       LEFT JOIN listings l ON l.id = cp.listing_id
+    `;
+
+    const countRes = await query(`SELECT COUNT(*) ${fromClause} ${where}`, params);
+    const total = parseInt(countRes.rows[0].count);
+
+    const rows = await query(
+      `SELECT r.*,
+              COALESCE(ut.full_name, ucp.full_name) AS tenant_name,
+              ul.full_name AS landlord_name,
+              COALESCE(p.name, l.title) AS property_name,
+              COALESCE(p.address, l.display_address) AS property_address,
+              COALESCE(rp.payment_method, 'mobile_money') AS payment_method,
+              COALESCE(rp.reference_number, cp.transaction_id) AS reference_number,
+              rp.notes
+       ${fromClause}
        ${where}
        ORDER BY r.created_at DESC
        LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
@@ -78,12 +92,12 @@ receiptsRouter.get('/:id', async (req, res) => {
   try {
     const result = await query(
       `SELECT r.*,
-              ut.full_name AS tenant_name,
+              COALESCE(ut.full_name, ucp.full_name) AS tenant_name,
               ul.full_name AS landlord_name,
-              p.name AS property_name,
-              p.address AS property_address,
-              rp.payment_method,
-              rp.reference_number,
+              COALESCE(p.name, l.title) AS property_name,
+              COALESCE(p.address, l.display_address) AS property_address,
+              COALESCE(rp.payment_method, 'mobile_money') AS payment_method,
+              COALESCE(rp.reference_number, cp.transaction_id) AS reference_number,
               rp.notes
        FROM receipts r
        LEFT JOIN tenants t  ON t.id = r.tenant_id
@@ -91,6 +105,9 @@ receiptsRouter.get('/:id', async (req, res) => {
        LEFT JOIN users ul   ON ul.id = r.landlord_id
        LEFT JOIN properties p ON p.id = r.property_id
        LEFT JOIN rent_payments rp ON rp.id = r.payment_id
+       LEFT JOIN campay_payments cp ON cp.id = r.campay_payment_id
+       LEFT JOIN users ucp  ON ucp.id = cp.payer_id
+       LEFT JOIN listings l ON l.id = cp.listing_id
        WHERE r.id = $1`,
       [req.params.id],
     );

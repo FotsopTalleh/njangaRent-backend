@@ -5,7 +5,6 @@ import { config } from './config.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import { authRouter } from './routes/auth.routes.js';
 import { listingsRouter } from './routes/listings.routes.js';
-import { nkwaPaymentsRouter } from './routes/nkwaPayments.routes.js';
 import { campayRouter } from './routes/campay.routes.js';
 import { messagesRouter } from './routes/messages.routes.js';
 import { visitsRouter } from './routes/visits.routes.js';
@@ -46,7 +45,6 @@ app.get('/health', (_req, res) => {
 // ── API Routes ─────────────────────────────────────────────────────────────────
 app.use('/api/auth',          authRouter);
 app.use('/api/listings',      listingsRouter);
-app.use('/api/nkwa',          nkwaPaymentsRouter);
 app.use('/api/campay',        campayRouter);
 app.use('/api/messages',      messagesRouter);
 app.use('/api/visits',        visitsRouter);

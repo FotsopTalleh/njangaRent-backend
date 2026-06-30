@@ -22,12 +22,7 @@ export const config = {
     secretKey:      process.env.CLERK_SECRET_KEY      ?? '',
   },
 
-  nkwa: {
-    apiKey:        process.env.NKWA_API_KEY        ?? '',
-    apiSecret:     process.env.NKWA_API_SECRET     ?? '',
-    webhookSecret: process.env.NKWA_WEBHOOK_SECRET ?? '',
-    baseUrl:       process.env.NKWA_BASE_URL       ?? 'https://sandbox.api.nkwa.com',
-  },
+
 
   seed: {
     adminEmail:    process.env.SEED_ADMIN_EMAIL    ?? 'admin@njangrent.cm',

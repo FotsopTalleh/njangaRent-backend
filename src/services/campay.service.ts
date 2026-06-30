@@ -5,15 +5,44 @@ import crypto from 'crypto';
 import { config } from '../config.js';
 import { query } from '../db/pool.js';
 
-// ── Campay REST client ────────────────────────────────────────────────────────
-// Uses the Permanent Access Token for all authenticated requests.
+// Uses an interceptor to fetch and attach a fresh token before requests.
 const campayClient = axios.create({
   baseURL: config.campay.baseUrl,
   headers: {
-    Authorization: `Token ${config.campay.permanentToken}`,
     'Content-Type': 'application/json',
   },
   timeout: 30_000,
+});
+
+let cachedToken: string | null = null;
+let tokenExpiresAt = 0;
+
+async function getCampayToken(): Promise<string> {
+  // If we have a valid token (with 1 minute buffer), return it
+  if (cachedToken && Date.now() < tokenExpiresAt - 60000) {
+    return cachedToken;
+  }
+
+  // Otherwise, fetch a new one
+  const response = await axios.post(`${config.campay.baseUrl}/token/`, {
+    username: config.campay.appUsername,
+    password: config.campay.appPassword,
+  });
+
+  cachedToken = response.data.token;
+  // expires_in is in seconds, typically 3600
+  tokenExpiresAt = Date.now() + (response.data.expires_in * 1000);
+  
+  return cachedToken!;
+}
+
+campayClient.interceptors.request.use(async (reqConfig) => {
+  // Don't intercept the token request itself if we ever made one via this client
+  if (!reqConfig.url?.includes('/token/')) {
+    const token = await getCampayToken();
+    reqConfig.headers.Authorization = `Token ${token}`;
+  }
+  return reqConfig;
 });
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -57,8 +86,8 @@ export const campayService = {
 
     // 1. Insert a pending payment record
     const insertResult = await query(
-      `INSERT INTO nkwa_payments
-         (listing_id, payer_id, landlord_id, amount, phone_number, payment_type, nkwa_status)
+      `INSERT INTO campay_payments
+         (listing_id, payer_id, landlord_id, amount, phone_number, payment_type, status)
        VALUES ($1, $2, $3, $4, $5, $6, 'initiated')
        RETURNING id`,
       [
@@ -73,7 +102,7 @@ export const campayService = {
     const paymentId = insertResult.rows[0].id as string;
 
     // 2. Call Campay if credentials are configured
-    if (config.campay.permanentToken) {
+    if (config.campay.appUsername && config.campay.appPassword) {
       try {
         const response = await campayClient.post('/collect/', {
           amount:            String(params.amount),
@@ -90,8 +119,8 @@ export const campayService = {
 
         if (reference) {
           await query(
-            `UPDATE nkwa_payments
-               SET nkwa_transaction_id = $1, nkwa_status = 'pending', updated_at = NOW()
+            `UPDATE campay_payments
+               SET transaction_id = $1, status = 'pending', updated_at = NOW()
              WHERE id = $2`,
             [reference, paymentId],
           );
@@ -108,7 +137,7 @@ export const campayService = {
         console.error('[Campay] collect error:', err.response?.data ?? err.message);
 
         await query(
-          `UPDATE nkwa_payments SET nkwa_status = 'failed', updated_at = NOW() WHERE id = $1`,
+          `UPDATE campay_payments SET status = 'failed', updated_at = NOW() WHERE id = $1`,
           [paymentId],
         );
 
@@ -119,8 +148,8 @@ export const campayService = {
     // 3. Mock mode — no real credentials configured
     const mockRef = `MOCK_${Date.now()}`;
     await query(
-      `UPDATE nkwa_payments
-         SET nkwa_transaction_id = $1, nkwa_status = 'pending', updated_at = NOW()
+      `UPDATE campay_payments
+         SET transaction_id = $1, status = 'pending', updated_at = NOW()
        WHERE id = $2`,
       [mockRef, paymentId],
     );
@@ -160,7 +189,7 @@ export const campayService = {
   },
 
   /**
-   * Handle Campay webhook — update nkwa_payments status.
+   * Handle Campay webhook — update campay_payments status.
    * Campay sends: { reference, status, amount, operator, ... }
    */
   async handleWebhook(data: {
@@ -172,12 +201,52 @@ export const campayService = {
     const dbStatus = data.status === 'SUCCESSFUL' ? 'confirmed' : 'failed';
 
     const result = await query(
-      `UPDATE nkwa_payments
-         SET nkwa_status = $1, updated_at = NOW()
-       WHERE nkwa_transaction_id = $2
-       RETURNING id`,
+      `UPDATE campay_payments
+         SET status = $1, updated_at = NOW()
+       WHERE transaction_id = $2
+       RETURNING id, amount, landlord_id, payer_id, payment_type`,
       [dbStatus, data.reference],
     );
+
+    if (dbStatus === 'confirmed' && result.rowCount && result.rowCount > 0) {
+      const payment = result.rows[0];
+      
+      // Check if a receipt already exists
+      const existing = await query(
+        `SELECT id FROM receipts WHERE campay_payment_id = $1`,
+        [payment.id]
+      );
+      
+      if (existing.rowCount === 0) {
+        const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+        const randomStr = Math.random().toString(36).substring(2, 6).toUpperCase();
+        const receiptNumber = `RCPT-${dateStr}-${randomStr}`;
+
+        // Attempt to find tenant/property if they are already assigned
+        const tenantRes = await query(
+          `SELECT id, property_id FROM tenants WHERE user_id = $1 AND landlord_id = $2 AND status = 'active' LIMIT 1`,
+          [payment.payer_id, payment.landlord_id]
+        );
+        
+        const tenantId = tenantRes.rows[0]?.id ?? null;
+        const propertyId = tenantRes.rows[0]?.property_id ?? null;
+
+        await query(
+          `INSERT INTO receipts 
+             (campay_payment_id, landlord_id, tenant_id, property_id, receipt_number, amount_paid, payment_date, period_label, status)
+           VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7, 'disbursed')`,
+          [
+            payment.id,
+            payment.landlord_id,
+            tenantId,
+            propertyId,
+            receiptNumber,
+            payment.amount,
+            payment.payment_type === 'deposit' ? 'Deposit Payment' : 'Rent Payment'
+          ]
+        );
+      }
+    }
 
     return { updated: result.rowCount ?? 0 };
   },
@@ -188,7 +257,7 @@ export const campayService = {
   async listForUser(userId: string) {
     const result = await query(
       `SELECT np.*, l.title AS listing_title
-         FROM nkwa_payments np
+         FROM campay_payments np
          LEFT JOIN listings l ON l.id = np.listing_id
         WHERE np.payer_id = $1
         ORDER BY np.created_at DESC`,
@@ -203,7 +272,7 @@ export const campayService = {
   async listForLandlord(landlordId: string) {
     const result = await query(
       `SELECT np.*, l.title AS listing_title
-         FROM nkwa_payments np
+         FROM campay_payments np
          LEFT JOIN listings l ON l.id = np.listing_id
         WHERE np.landlord_id = $1
         ORDER BY np.created_at DESC`,
