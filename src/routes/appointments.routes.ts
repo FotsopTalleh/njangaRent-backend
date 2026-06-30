@@ -65,15 +65,30 @@ appointmentsRouter.get('/', async (req, res) => {
 // Student requests a viewing
 appointmentsRouter.post('/', async (req, res) => {
   try {
+    // Only students/tenants can request a viewing
+    if (req.user!.role === 'landlord' || req.user!.role === 'admin') {
+      return error(res, 'Only students can request a viewing', 403);
+    }
+
     const { listingId, proposedDate, proposedSlot, studentNote } = req.body;
     if (!listingId || !proposedDate || !proposedSlot) {
       return error(res, 'listingId, proposedDate, and proposedSlot are required');
     }
 
+    // Validate slot value
+    const validSlots = ['morning', 'afternoon', 'evening'];
+    if (!validSlots.includes(proposedSlot)) {
+      return error(res, `proposedSlot must be one of: ${validSlots.join(', ')}`);
+    }
+
     // Get landlord from the listing
-    const listingRes = await query('SELECT landlord_id FROM listings WHERE id = $1', [listingId]);
-    if (!listingRes.rows.length) return error(res, 'Listing not found', 404);
-    const landlordId = listingRes.rows[0].landlord_id;
+    const listingRes = await query(
+      'SELECT id, landlord_id, title, display_address FROM listings WHERE id = $1 AND status = $2',
+      [listingId, 'active']
+    );
+    if (!listingRes.rows.length) return error(res, 'Listing not found or not available', 404);
+    const listingRow = listingRes.rows[0];
+    const landlordId = listingRow.landlord_id;
 
     const result = await query(
       `INSERT INTO appointments
@@ -83,7 +98,21 @@ appointmentsRouter.post('/', async (req, res) => {
       [listingId, req.user!.sub, landlordId, proposedDate, proposedSlot, studentNote ?? null],
     );
 
-    return success(res, { data: snakeToAppointment(result.rows[0]) }, 201);
+    // Notify landlord
+    await query(
+      `INSERT INTO notifications (user_id, type, title, body, action_url)
+       VALUES ($1, 'viewing_request', 'New viewing request', $2, '/landlord/appointments')`,
+      [landlordId, `${req.user!.name} has requested a viewing for "${listingRow.title}".`]
+    );
+
+    const appt = snakeToAppointment(result.rows[0]);
+    return success(res, {
+      data: {
+        ...appt,
+        listingTitle: listingRow.title,
+        listingAddress: listingRow.display_address,
+      }
+    }, 201);
   } catch (err: any) {
     console.error('[appointments] create error:', err.message);
     return error(res, err.message, 500);
