@@ -282,13 +282,6 @@ export const campayService = {
     description: string;
     paymentId:   string;   // our internal campay_payment id, used as external_reference
   }): Promise<void> {
-    // Skip disburse entirely on demo environment (endpoint doesn't exist)
-    const isDemo = config.campay.baseUrl.includes('demo.campay.net');
-    if (isDemo) {
-      console.info('[campay] Demo mode — skipping disburse to landlord (not available in sandbox)');
-      return;
-    }
-
     // Fetch landlord's phone from DB
     const landlordRes = await query(
       `SELECT phone, full_name FROM users WHERE id = $1`,
@@ -304,11 +297,10 @@ export const campayService = {
     const rawPhone = String(landlord.phone).replace(/^\+/, '').replace(/\s/g, '');
     const normPhone = rawPhone.startsWith('237') ? rawPhone : `237${rawPhone}`;
 
-    // CamPay /transfer/ (disburse) endpoint
-    // Docs: https://campay.net/api/docs/#tag/Transfer
-    const response = await campayClient.post('/transfer/', {
+    // CamPay /withdraw/ (disburse) endpoint
+    // Docs: https://campay.net/api/docs/#tag/Withdraw
+    const response = await campayClient.post('/withdraw/', {
       amount:             String(params.amount),
-      currency:           'XAF',
       to:                 normPhone,
       description:        params.description,
       external_reference: `DISB_${params.paymentId}`,
